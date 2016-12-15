@@ -1,4 +1,4 @@
-"""Unit tests for Caravel"""
+"""Unit tests for Superset"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -11,26 +11,20 @@ import io
 import random
 import unittest
 
-
 from flask import escape
-from flask_appbuilder.security.sqla import models as ab_models
 
-import caravel
-from caravel import app, db, models, utils, appbuilder, sm
-from caravel.source_registry import SourceRegistry
-from caravel.models import DruidDatasource
-from caravel.views import DatabaseView
+from superset import db, models, utils, appbuilder, sm, jinja_context, sql_lab
+from superset.views import DatabaseView
 
-from .base_tests import CaravelTestCase
+from .base_tests import SupersetTestCase
+import logging
 
 
-class CoreTests(CaravelTestCase):
+class CoreTests(SupersetTestCase):
 
     requires_examples = True
 
     def __init__(self, *args, **kwargs):
-        # Load examples first, so that we setup proper permission-view
-        # relations for all example data sources.
         super(CoreTests, self).__init__(*args, **kwargs)
 
     @classmethod
@@ -46,23 +40,23 @@ class CoreTests(CaravelTestCase):
         db.session.query(models.DatasourceAccessRequest).delete()
 
     def tearDown(self):
-        pass
+        db.session.query(models.Query).delete()
 
     def test_welcome(self):
         self.login()
-        resp = self.client.get('/caravel/welcome')
+        resp = self.client.get('/superset/welcome')
         assert 'Welcome' in resp.data.decode('utf-8')
 
     def test_slice_endpoint(self):
         self.login(username='admin')
         slc = self.get_slice("Girls", db.session)
-        resp = self.get_resp('/caravel/slice/{}/'.format(slc.id))
+        resp = self.get_resp('/superset/slice/{}/'.format(slc.id))
         assert 'Time Column' in resp
         assert 'List Roles' in resp
 
         # Testing overrides
         resp = self.get_resp(
-            '/caravel/slice/{}/?standalone=true'.format(slc.id))
+            '/superset/slice/{}/?standalone=true'.format(slc.id))
         assert 'List Roles' not in resp
 
     def test_endpoints_for_a_slice(self):
@@ -104,19 +98,27 @@ class CoreTests(CaravelTestCase):
 
     def test_save_slice(self):
         self.login(username='admin')
-        slice_id = self.get_slice("Energy Sankey", db.session).id
+        slice_name = "Energy Sankey"
+        slice_id = self.get_slice(slice_name, db.session).id
+        db.session.commit()
         copy_name = "Test Sankey Save"
         tbl_id = self.table_ids.get('energy_usage')
         url = (
-            "/caravel/explore/table/{}/?viz_type=sankey&groupby=source&"
+            "/superset/explore/table/{}/?viz_type=sankey&groupby=source&"
             "groupby=target&metric=sum__value&row_limit=5000&where=&having=&"
             "flt_col_0=source&flt_op_0=in&flt_eq_0=&slice_id={}&slice_name={}&"
             "collapsed_fieldsets=&action={}&datasource_name=energy_usage&"
             "datasource_id=1&datasource_type=table&previous_viz_type=sankey")
 
-        db.session.commit()
+        # Changing name
         resp = self.get_resp(url.format(tbl_id, slice_id, copy_name, 'save'))
         assert copy_name in resp
+
+        # Setting the name back to its original name
+        resp = self.get_resp(url.format(tbl_id, slice_id, slice_name, 'save'))
+        assert slice_name in resp
+
+        # Doing a basic overwrite
         assert 'Energy' in self.get_resp(
             url.format(tbl_id, slice_id, copy_name, 'overwrite'))
 
@@ -130,12 +132,32 @@ class CoreTests(CaravelTestCase):
                 (slc.slice_name, 'slice_url', slc.slice_url),
                 (slc.slice_name, 'json_endpoint', slc.viz.json_endpoint),
                 (slc.slice_name, 'csv_endpoint', slc.viz.csv_endpoint),
-                (slc.slice_name, 'slice_id_url',
-                    "/caravel/{slc.datasource_type}/{slc.datasource_id}/{slc.id}/".format(slc=slc)),
+                (slc.slice_name, 'slice_id_url', slc.slice_id_url),
+            ]
+        for name, method, url in urls:
+            logging.info("[{name}]/[{method}]: {url}".format(**locals()))
+            self.client.get(url)
+
+    def test_slices_V2(self):
+        # Add explore-v2-beta role to admin user
+        # Test all slice urls as user with with explore-v2-beta role
+        sm.add_role('explore-v2-beta')
+
+        appbuilder.sm.add_user(
+            'explore_beta', 'explore_beta', ' user', 'explore_beta@airbnb.com',
+            appbuilder.sm.find_role('explore-v2-beta'),
+            password='general')
+        self.login(username='explore_beta', password='general')
+
+        Slc = models.Slice
+        urls = []
+        for slc in db.session.query(Slc).all():
+            urls += [
+                (slc.slice_name, 'slice_url', slc.slice_url),
             ]
         for name, method, url in urls:
             print("[{name}]/[{method}]: {url}".format(**locals()))
-            self.client.get(url)
+            response = self.client.get(url)
 
     def test_dashboard(self):
         self.login(username='admin')
@@ -146,7 +168,7 @@ class CoreTests(CaravelTestCase):
             assert escape(title) in self.client.get(url).data.decode('utf-8')
 
     def test_doctests(self):
-        modules = [utils, models]
+        modules = [utils, models, sql_lab]
         for mod in modules:
             failed, tests = doctest.testmod(mod)
             if failed:
@@ -157,19 +179,14 @@ class CoreTests(CaravelTestCase):
         assert self.get_resp('/ping') == "OK"
 
     def test_testconn(self):
-        database = (
-            db.session
-            .query(models.Database)
-            .filter_by(database_name='main')
-            .first()
-        )
+        database = self.get_main_database(db.session)
 
         # validate that the endpoint works with the password-masked sqlalchemy uri
         data = json.dumps({
             'uri': database.safe_sqlalchemy_uri(),
             'name': 'main'
         })
-        response = self.client.post('/caravel/testconn', data=data, content_type='application/json')
+        response = self.client.post('/superset/testconn', data=data, content_type='application/json')
         assert response.status_code == 200
 
         # validate that the endpoint works with the decrypted sqlalchemy uri
@@ -177,37 +194,35 @@ class CoreTests(CaravelTestCase):
             'uri': database.sqlalchemy_uri_decrypted,
             'name': 'main'
         })
-        response = self.client.post('/caravel/testconn', data=data, content_type='application/json')
+        response = self.client.post('/superset/testconn', data=data, content_type='application/json')
         assert response.status_code == 200
 
     def test_databaseview_edit(self, username='admin'):
         # validate that sending a password-masked uri does not over-write the decrypted uri
         self.login(username=username)
-        database = db.session.query(models.Database).filter_by(database_name='main').first()
+        database = self.get_main_database(db.session)
         sqlalchemy_uri_decrypted = database.sqlalchemy_uri_decrypted
         url = 'databaseview/edit/{}'.format(database.id)
         data = {k: database.__getattribute__(k) for k in DatabaseView.add_columns}
         data['sqlalchemy_uri'] = database.safe_sqlalchemy_uri()
-        response = self.client.post(url, data=data)
-        database = db.session.query(models.Database).filter_by(database_name='main').first()
+        self.client.post(url, data=data)
+        database = self.get_main_database(db.session)
         self.assertEqual(sqlalchemy_uri_decrypted, database.sqlalchemy_uri_decrypted)
 
     def test_warm_up_cache(self):
         slice = db.session.query(models.Slice).first()
-        resp = self.get_resp(
-            '/caravel/warm_up_cache?slice_id={}'.format(slice.id))
-        data = json.loads(resp)
+        data = self.get_json_resp(
+            '/superset/warm_up_cache?slice_id={}'.format(slice.id))
         assert data == [{'slice_id': slice.id, 'slice_name': slice.slice_name}]
 
-        resp = self.get_resp(
-            '/caravel/warm_up_cache?table_name=energy_usage&db_name=main')
-        data = json.loads(resp)
+        data = self.get_json_resp(
+            '/superset/warm_up_cache?table_name=energy_usage&db_name=main')
         assert len(data) == 3
 
     def test_shortner(self):
         self.login(username='admin')
         data = (
-            "//caravel/explore/table/1/?viz_type=sankey&groupby=source&"
+            "//superset/explore/table/1/?viz_type=sankey&groupby=source&"
             "groupby=target&metric=sum__value&row_limit=5000&where=&having=&"
             "flt_col_0=source&flt_op_0=in&flt_eq_0=&slice_id=78&slice_name="
             "Energy+Sankey&collapsed_fieldsets=&action=&datasource_name="
@@ -235,9 +250,45 @@ class CoreTests(CaravelTestCase):
             'expanded_slices': {},
             'positions': positions,
         }
-        url = '/caravel/save_dash/{}/'.format(dash.id)
+        url = '/superset/save_dash/{}/'.format(dash.id)
         resp = self.client.post(url, data=dict(data=json.dumps(data)))
         assert "SUCCESS" in resp.data.decode('utf-8')
+
+    def test_copy_dash(self, username='admin'):
+        self.login(username=username)
+        dash = db.session.query(models.Dashboard).filter_by(
+            slug="births").first()
+        positions = []
+        for i, slc in enumerate(dash.slices):
+            d = {
+                'col': 0,
+                'row': i * 4,
+                'size_x': 4,
+                'size_y': 4,
+                'slice_id': '{}'.format(slc.id)}
+            positions.append(d)
+        data = {
+            'css': '',
+            'expanded_slices': {},
+            'positions': positions,
+            'dashboard_title': 'Copy Of Births',
+        }
+
+        # Save changes to Births dashboard and retrieve updated dash
+        dash_id = dash.id
+        url = '/superset/save_dash/{}/'.format(dash_id)
+        self.client.post(url, data=dict(data=json.dumps(data)))
+        dash = db.session.query(models.Dashboard).filter_by(
+            id=dash_id).first()
+        orig_json_data = json.loads(dash.json_data)
+
+        # Verify that copy matches original
+        url = '/superset/copy_dash/{}/'.format(dash_id)
+        resp = self.get_json_resp(url, data=dict(data=json.dumps(data)))
+        self.assertEqual(resp['dashboard_title'], 'Copy Of Births')
+        self.assertEqual(resp['position_json'], orig_json_data['position_json'])
+        self.assertEqual(resp['metadata'], orig_json_data['metadata'])
+        self.assertEqual(resp['slices'], orig_json_data['slices'])
 
     def test_add_slices(self, username='admin'):
         self.login(username=username)
@@ -251,7 +302,7 @@ class CoreTests(CaravelTestCase):
             "slice_ids": [new_slice.data["slice_id"],
                           existing_slice.data["slice_id"]]
         }
-        url = '/caravel/add_slices/{}/'.format(dash.id)
+        url = '/superset/add_slices/{}/'.format(dash.id)
         resp = self.client.post(url, data=dict(data=json.dumps(data)))
         assert "SLICES ADDED" in resp.data.decode('utf-8')
 
@@ -274,68 +325,17 @@ class CoreTests(CaravelTestCase):
         assert "List Slice" in self.get_resp('/slicemodelview/list/')
         assert "List Dashboard" in self.get_resp('/dashboardmodelview/list/')
 
-    def run_sql(self, sql, user_name, client_id):
-        self.login(username=user_name)
-        dbid = (
-            db.session.query(models.Database)
-            .filter_by(database_name='main')
-            .first().id
-        )
-        resp = self.client.post(
-            '/caravel/sql_json/',
-            data=dict(database_id=dbid, sql=sql, select_as_create_as=False,
-                      client_id=client_id),
-        )
-        self.logout()
-        return json.loads(resp.data.decode('utf-8'))
-
-    def test_sql_json(self):
-        data = self.run_sql('SELECT * FROM ab_user', 'admin', "1")
-        assert len(data['data']) > 0
-
-        data = self.run_sql('SELECT * FROM unexistant_table', 'admin', "2")
-        assert len(data['error']) > 0
-
-    def test_sql_json_has_access(self):
-        main_db = (
-            db.session.query(models.Database).filter_by(database_name="main").first()
-        )
-        utils.merge_perm(sm, 'database_access', main_db.perm)
-        db.session.commit()
-        main_db_permission_view = (
-            db.session.query(ab_models.PermissionView)
-            .join(ab_models.ViewMenu)
-            .filter(ab_models.ViewMenu.name == '[main].(id:1)')
-            .first()
-        )
-        astronaut = sm.add_role("Astronaut")
-        sm.add_permission_role(astronaut, main_db_permission_view)
-        # Astronaut role is Gamma + main db permissions
-        for gamma_perm in sm.find_role('Gamma').permissions:
-            sm.add_permission_role(astronaut, gamma_perm)
-
-        gagarin = appbuilder.sm.find_user('gagarin')
-        if not gagarin:
-            appbuilder.sm.add_user(
-                'gagarin', 'Iurii', 'Gagarin', 'gagarin@cosmos.ussr',
-                appbuilder.sm.find_role('Astronaut'),
-                password='general')
-        data = self.run_sql('SELECT * FROM ab_user', 'gagarin', "3")
-        db.session.query(models.Query).delete()
-        db.session.commit()
-        assert len(data['data']) > 0
-
     def test_csv_endpoint(self):
+        self.login('admin')
         sql = """
             SELECT first_name, last_name
             FROM ab_user
             WHERE first_name='admin'
         """
         client_id = "{}".format(random.getrandbits(64))[:10]
-        self.run_sql(sql, 'admin', client_id)
+        self.run_sql(sql, client_id)
 
-        self.login('admin')
-        resp = self.get_resp('/caravel/csv/{}'.format(client_id))
+        resp = self.get_resp('/superset/csv/{}'.format(client_id))
         data = csv.reader(io.StringIO(resp))
         expected_data = csv.reader(
             io.StringIO("first_name,last_name\nadmin, user\n"))
@@ -343,77 +343,49 @@ class CoreTests(CaravelTestCase):
         self.assertEqual(list(expected_data), list(data))
         self.logout()
 
-    def test_queries_endpoint(self):
-        resp = self.client.get('/caravel/queries/{}'.format(0))
-        self.assertEquals(403, resp.status_code)
-
-        self.login('admin')
-        resp = self.get_resp('/caravel/queries/{}'.format(0))
-        data = json.loads(resp)
-        self.assertEquals(0, len(data))
-        self.logout()
-
-        self.run_sql("SELECT * FROM ab_user", 'admin', client_id='client_id_1')
-        self.run_sql("SELECT * FROM ab_user1", 'admin', client_id='client_id_2')
-        self.login('admin')
-        resp = self.get_resp('/caravel/queries/{}'.format(0))
-        data = json.loads(resp)
-        self.assertEquals(2, len(data))
-
-        query = db.session.query(models.Query).filter_by(
-            sql='SELECT * FROM ab_user').first()
-        query.changed_on = utils.EPOCH
-        db.session.commit()
-
-        resp = self.get_resp('/caravel/queries/{}'.format(123456000))
-        data = json.loads(resp)
-        self.assertEquals(1, len(data))
-
-        self.logout()
-        resp = self.client.get('/caravel/queries/{}'.format(0))
-        self.assertEquals(403, resp.status_code)
-
-    def test_search_query_endpoint(self):
-        userId = 'userId=null'
-        databaseId = 'databaseId=null'
-        searchText = 'searchText=null'
-        status = 'status=success'
-        params = [userId, databaseId, searchText, status]
-        resp = self.client.get('/caravel/search_queries?'+'&'.join(params))
-        self.assertEquals(200, resp.status_code)
-
     def test_public_user_dashboard_access(self):
+        table = (
+            db.session
+            .query(models.SqlaTable)
+            .filter_by(table_name='birth_names')
+            .one()
+        )
         # Try access before adding appropriate permissions.
-        self.revoke_public_access('birth_names')
+        self.revoke_public_access_to_table(table)
         self.logout()
 
         resp = self.get_resp('/slicemodelview/list/')
-        assert 'birth_names</a>' not in resp
+        self.assertNotIn('birth_names</a>', resp)
 
         resp = self.get_resp('/dashboardmodelview/list/')
-        assert '/caravel/dashboard/births/' not in resp
+        self.assertNotIn('/superset/dashboard/births/', resp)
 
-        self.setup_public_access_for_dashboard('birth_names')
+        self.grant_public_access_to_table(table)
 
         # Try access after adding appropriate permissions.
-        assert 'birth_names' in self.get_resp('/slicemodelview/list/')
+        self.assertIn('birth_names', self.get_resp('/slicemodelview/list/'))
 
         resp = self.get_resp('/dashboardmodelview/list/')
-        assert "/caravel/dashboard/births/" in resp
+        self.assertIn("/superset/dashboard/births/", resp)
 
-        print(self.get_resp('/caravel/dashboard/births/'))
-        assert 'Births' in self.get_resp('/caravel/dashboard/births/')
+        self.assertIn('Births', self.get_resp('/superset/dashboard/births/'))
 
         # Confirm that public doesn't have access to other datasets.
         resp = self.get_resp('/slicemodelview/list/')
-        assert 'wb_health_population</a>' not in resp
+        self.assertNotIn('wb_health_population</a>', resp)
 
         resp = self.get_resp('/dashboardmodelview/list/')
-        assert "/caravel/dashboard/world_health/" not in resp
+        self.assertNotIn("/superset/dashboard/world_health/", resp)
 
     def test_dashboard_with_created_by_can_be_accessed_by_public_users(self):
         self.logout()
-        self.setup_public_access_for_dashboard('birth_names')
+        table = (
+            db.session
+            .query(models.SqlaTable)
+            .filter_by(table_name='birth_names')
+            .one()
+        )
+        self.grant_public_access_to_table(table)
 
         dash = db.session.query(models.Dashboard).filter_by(dashboard_title="Births").first()
         dash.owners = [appbuilder.sm.find_user('admin')]
@@ -421,7 +393,7 @@ class CoreTests(CaravelTestCase):
         db.session.merge(dash)
         db.session.commit()
 
-        assert 'Births' in self.get_resp('/caravel/dashboard/births/')
+        assert 'Births' in self.get_resp('/superset/dashboard/births/')
 
     def test_only_owners_can_save(self):
         dash = (
@@ -452,6 +424,95 @@ class CoreTests(CaravelTestCase):
         db.session.commit()
         self.test_save_dash('alpha')
 
+    def test_extra_table_metadata(self):
+        self.login('admin')
+        dbid = self.get_main_database(db.session).id
+        self.get_json_resp(
+            '/superset/extra_table_metadata/{dbid}/'
+            'ab_permission_view/panoramix/'.format(**locals()))
+
+    def test_process_template(self):
+        maindb = self.get_main_database(db.session)
+        sql = "SELECT '{{ datetime(2017, 1, 1).isoformat() }}'"
+        tp = jinja_context.get_template_processor(database=maindb)
+        rendered = tp.process_template(sql)
+        self.assertEqual("SELECT '2017-01-01T00:00:00'", rendered)
+
+    def test_templated_sql_json(self):
+        self.login('admin')
+        sql = "SELECT '{{ datetime(2017, 1, 1).isoformat() }}' as test"
+        data = self.run_sql(sql, "fdaklj3ws")
+        self.assertEqual(data['data'][0]['test'], "2017-01-01T00:00:00")
+
+    def test_table_metadata(self):
+        maindb = self.get_main_database(db.session)
+        data = self.get_json_resp(
+            "/superset/table/{}/ab_user/null/".format(maindb.id))
+        self.assertEqual(data['name'], 'ab_user')
+        assert len(data['columns']) > 5
+        assert data.get('selectStar').startswith('SELECT')
+
+        # Engine specific tests
+        backend = maindb.backend
+        if backend in ('mysql', 'postgresql'):
+            self.assertEqual(data.get('primaryKey').get('type'), 'pk')
+            self.assertEqual(
+                data.get('primaryKey').get('column_names')[0], 'id')
+            self.assertEqual(len(data.get('foreignKeys')), 2)
+            if backend == 'mysql':
+                self.assertEqual(len(data.get('indexes')), 7)
+            elif backend == 'postgresql':
+                self.assertEqual(len(data.get('indexes')), 5)
+
+    def test_fetch_datasource_metadata(self):
+        self.login(username='admin')
+        url = '/superset/fetch_datasource_metadata?datasource_type=table&' \
+              'datasource_id=1'
+        resp = json.loads(self.get_resp(url))
+        self.assertEqual(len(resp['field_options']), 21)
+
+    def test_fetch_all_tables(self):
+        self.login(username='admin')
+        database = self.get_main_database(db.session)
+        url = '/superset/all_tables/{}'.format(database.id)
+        resp = json.loads(self.get_resp(url))
+        self.assertIn('tables', resp)
+        self.assertIn('views', resp)
+
+    def test_user_profile(self):
+        self.login(username='admin')
+        slc = self.get_slice("Girls", db.session)
+
+        # Setting some faves
+        url = '/superset/favstar/Slice/{}/select/'.format(slc.id)
+        resp = self.get_json_resp(url)
+        self.assertEqual(resp['count'], 1)
+
+        dash = (
+            db.session
+            .query(models.Dashboard)
+            .filter_by(slug="births")
+            .first()
+        )
+        url = '/superset/favstar/Dashboard/{}/select/'.format(dash.id)
+        resp = self.get_json_resp(url)
+        self.assertEqual(resp['count'], 1)
+
+        userid = appbuilder.sm.find_user('admin').id
+        resp = self.get_resp('/superset/profile/admin/')
+        self.assertIn('"app"', resp)
+        data = self.get_json_resp('/superset/recent_activity/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/created_slices/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/created_dashboards/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/fave_slices/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/fave_dashboards/{}/'.format(userid))
+        self.assertNotIn('message', data)
+
 
 if __name__ == '__main__':
     unittest.main()
+
